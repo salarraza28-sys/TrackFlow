@@ -172,6 +172,7 @@ def track_activity():
                 if current_app is not None:
                     duration = (now - start_time).total_seconds() / 60.0
                     if duration >= 0.05: # At least 3 seconds
+                        logs = load_logs() # Reload from disk to prevent memory overwrite
                         logs.append({
                             "application": current_app,
                             "window": current_window,
@@ -197,6 +198,8 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
 
     def do_OPTIONS(self):
         self.send_response(200)
@@ -204,14 +207,14 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        if self.path == '/api/logs':
+        if self.path.startswith('/api/logs'):
             self.send_response(200)
             self._send_cors_headers()
             self.send_header('Content-type', 'application/json')
             self.end_headers()
             logs = load_logs()
             self.wfile.write(json.dumps(logs).encode())
-        elif self.path == '/api/status':
+        elif self.path.startswith('/api/status'):
             self.send_response(200)
             self._send_cors_headers()
             self.send_header('Content-type', 'application/json')
@@ -243,6 +246,13 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.send_header('Content-type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps({"success": True, "logs": logs}).encode())
+        elif self.path == '/api/clear':
+            save_logs([])
+            self.send_response(200)
+            self._send_cors_headers()
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"success": True, "logs": []}).encode())
         else:
             self.send_response(404)
             self.end_headers()

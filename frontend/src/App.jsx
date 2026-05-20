@@ -27,9 +27,10 @@ const App = () => {
 
   const fetchData = async () => {
     try {
+      const timestamp = new Date().getTime();
       const [logsRes, statusRes] = await Promise.all([
-        fetch(`${API_BASE}/logs`),
-        fetch(`${API_BASE}/status`)
+        fetch(`${API_BASE}/logs?t=${timestamp}`, { cache: 'no-store' }),
+        fetch(`${API_BASE}/status?t=${timestamp}`, { cache: 'no-store' })
       ]);
       
       const logsData = await logsRes.json();
@@ -78,6 +79,18 @@ const App = () => {
     }
   };
 
+  const clearLogs = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/clear`, { method: 'POST' });
+      const data = await res.json();
+      if (data.success) {
+        setLogs([]);
+      }
+    } catch (err) {
+      console.error("Failed to clear logs:", err);
+    }
+  };
+
   // Compute statistics
   const today = moment().startOf('day');
   const todayLogs = logs.filter(log => moment(log.start_time).isSameOrAfter(today));
@@ -92,7 +105,7 @@ const App = () => {
   });
   const pieData = Object.keys(appStats).map(app => ({
     name: app,
-    value: Math.round(appStats[app])
+    value: Number(appStats[app].toFixed(2))
   })).sort((a, b) => b.value - a.value).slice(0, 6);
 
   // Timeline for Bar chart
@@ -104,11 +117,17 @@ const App = () => {
   });
   const barData = Object.keys(timelineStats).map(hour => ({
     time: hour,
-    minutes: Math.round(timelineStats[hour])
+    minutes: Number(timelineStats[hour].toFixed(2))
   }));
 
   const formatDuration = (mins) => {
-    if (mins < 60) return `${Math.round(mins)}m`;
+    if (mins < 1) {
+      const secs = Math.round(mins * 60);
+      return `${secs}s`;
+    }
+    if (mins < 60) {
+      return `${mins.toFixed(1)}m`;
+    }
     const h = Math.floor(mins / 60);
     const m = Math.round(mins % 60);
     return `${h}h ${m}m`;
@@ -307,7 +326,7 @@ const App = () => {
                       <div className="w-3 h-3 rounded-full" style={{backgroundColor: COLORS[index % COLORS.length]}}></div>
                       <span className="text-slate-300 truncate max-w-[120px]">{entry.name}</span>
                     </div>
-                    <span className="font-medium">{Math.round(entry.value)}m</span>
+                    <span className="font-medium">{formatDuration(entry.value)}</span>
                   </div>
                 ))}
               </div>
@@ -319,9 +338,17 @@ const App = () => {
               <h3 className="text-lg font-semibold flex items-center gap-2">
                 <FileText className="w-5 h-5 text-blue-500" /> Review Generated Logs
               </h3>
-              <button className="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors cursor-pointer">
-                Approve Today's Logs
-              </button>
+              <div className="flex gap-3">
+                <button 
+                  onClick={clearLogs}
+                  className="border border-slate-700 hover:bg-slate-800 text-slate-300 px-4 py-2 rounded-lg text-sm font-medium transition-colors cursor-pointer"
+                >
+                  Clear All Logs
+                </button>
+                <button className="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors cursor-pointer">
+                  Approve Today's Logs
+                </button>
+              </div>
             </div>
             <div className="overflow-x-auto">
               <table className="w-full text-left border-collapse">
