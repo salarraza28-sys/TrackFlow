@@ -1,23 +1,110 @@
 import React, { useState, useEffect } from 'react';
-import { 
+import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
-  PieChart, Pie, Cell
+  PieChart as RechartsPieChart, Pie, Cell
 } from 'recharts';
-import { 
-  Play, Pause, Activity, Clock, Layout, Monitor, Shield, 
-  RefreshCw, CheckCircle2, FileText
+import {
+  Play, Pause, Activity, Clock, Layout, Monitor, Shield,
+  RefreshCw, CheckCircle2, FileText, PieChart, Sparkles,
+  AlertCircle, Loader2, Eye, EyeOff
 } from 'lucide-react';
 import moment from 'moment';
 
-const API_BASE = 'http://localhost:5001/api';
+const API_BASE = 'http://localhost:5173/api';
+const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
 
 const COLORS = ['#3b82f6', '#8b5cf6', '#ec4899', '#f43f5e', '#f59e0b', '#10b981', '#06b6d4'];
+
+// ── Programmatic heuristic narration (No API required) ────────────────────────
+function generateHeuristicNarratives(entries) {
+  return entries.map(entry => {
+    let app = entry.application || "Unknown App";
+    let windowTitle = entry.window || "";
+    let duration = entry.duration_minutes || 0;
+
+    let durationText = "";
+    if (duration < 1) {
+      durationText = `${Math.round(duration * 60)} sec`;
+    } else if (duration < 60) {
+      durationText = `${Math.round(duration)} min`;
+    } else {
+      let h = Math.floor(duration / 60);
+      let m = Math.round(duration % 60);
+      durationText = m > 0 ? `${h} hr ${m} min` : `${h} hr`;
+    }
+
+    let summary = "Desktop Activity";
+    let desc = "";
+    let commentary = "";
+
+    const appLower = app.toLowerCase();
+    const winLower = windowTitle.toLowerCase();
+
+    if (appLower.includes("code") || appLower.includes("antigravity") || winLower.includes("vscode") || winLower.includes("studio")) {
+      summary = "Software Development";
+      let project = windowTitle.replace(/( - )?(visual studio code|antigravity)/gi, '').trim();
+      if (!project || project === "unknown window") project = "project files";
+      desc = `Worked on ${project} in ${app} for ${durationText}. Reviewed code logic and actively tested software state transitions. Visited files related to development and optimization.`;
+      commentary = "Focused development session.";
+    } else if (appLower.includes("chrome") || appLower.includes("browser") || appLower.includes("firefox")) {
+      summary = "Web Browsing";
+      let site = windowTitle.replace(/( - )?(google chrome|mozilla firefox)/gi, '').trim();
+      if (winLower.includes("youtube") || winLower.includes("video")) {
+        summary = "Video Content";
+        desc = `Watched video content (${site}) for ${durationText}.`;
+        commentary = "Media consumption.";
+      } else if (winLower.includes("docs") || winLower.includes("sheet") || winLower.includes("notion")) {
+        summary = "Documentation";
+        desc = `Read and edited documentation (${site}) for ${durationText}. Organized thoughts and structured written content.`;
+        commentary = "Productive documentation time.";
+      } else {
+        desc = `Browsed the web for ${durationText}. Interacted with pages related to ${site}.`;
+        commentary = "General research.";
+      }
+    } else if (appLower.includes("terminal") || appLower.includes("alacritty") || appLower.includes("konsole")) {
+      summary = "Terminal & CLI";
+      desc = `Executed terminal commands and managed system tasks via ${app} for ${durationText}. Checked configurations and monitored background scripts.`;
+      commentary = "Command line operations.";
+    } else if (appLower.includes("nautilus") || appLower.includes("explorer") || appLower.includes("files")) {
+      summary = "File Management";
+      desc = `Organized local files and navigated directories using ${app} for ${durationText}. Managed active folders and data structures.`;
+      commentary = "System organization.";
+    } else {
+      desc = `Maintained focus on "${windowTitle}" via ${app} for ${durationText}. Interacted with active application interfaces and processed current tasks.`;
+      commentary = "Standard application usage.";
+    }
+
+    return {
+      index: entry.index,
+      summary: summary,
+      description: desc,
+      commentary: commentary
+    };
+  });
+}
+
+// ── Try to persist narrated logs back to the local server (silent fail) ───────
+async function trySaveToServer(logs) {
+  try {
+    await fetch(`${API_BASE}/update_logs`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ logs }),
+    });
+  } catch (_) { /* server may not be running — that's fine */ }
+}
 
 const App = () => {
   const [logs, setLogs] = useState([]);
   const [isPaused, setIsPaused] = useState(false);
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState('dashboard');
+
+  // Narrative generation state
+  const [apiKey, setApiKey] = useState(() => sessionStorage.getItem('tf_api_key') || '');
+  const [showKey, setShowKey] = useState(false);
+  const [narrativeLoading, setNarrativeLoading] = useState(false);
+  const [narrativeError, setNarrativeError] = useState(null);
 
   useEffect(() => {
     fetchData();
@@ -27,29 +114,17 @@ const App = () => {
 
   const fetchData = async () => {
     try {
-      const timestamp = new Date().getTime();
+      const t = Date.now();
       const [logsRes, statusRes] = await Promise.all([
-        fetch(`${API_BASE}/logs?t=${timestamp}`, { cache: 'no-store' }),
-        fetch(`${API_BASE}/status?t=${timestamp}`, { cache: 'no-store' })
+        fetch(`${API_BASE}/logs?t=${t}`, { cache: 'no-store' }),
+        fetch(`${API_BASE}/status?t=${t}`, { cache: 'no-store' })
       ]);
-      
-      const logsData = await logsRes.json();
-      const statusData = await statusRes.json();
-      
-      setLogs(logsData);
-      setIsPaused(statusData.paused);
+      setLogs(await logsRes.json());
+      setIsPaused((await statusRes.json()).paused);
       setLoading(false);
     } catch (err) {
-      console.error("Failed to fetch data:", err);
-      // Fallback dummy data if backend is not running yet
-      if (logs.length === 0) {
-        setLogs([
-            { application: "Visual Studio Code", window: "App.jsx - frontend", start_time: new Date(Date.now() - 3600000).toISOString(), end_time: new Date().toISOString(), duration_minutes: 60 },
-            { application: "Google Chrome", window: "React Documentation", start_time: new Date(Date.now() - 7200000).toISOString(), end_time: new Date(Date.now() - 3600000).toISOString(), duration_minutes: 45 },
-            { application: "Slack", window: "Engineering Team", start_time: new Date(Date.now() - 8000000).toISOString(), end_time: new Date(Date.now() - 7200000).toISOString(), duration_minutes: 15 }
-        ]);
-        setLoading(false);
-      }
+      console.error('Failed to fetch data:', err);
+      setLoading(false);
     }
   };
 
@@ -63,19 +138,7 @@ const App = () => {
       });
       setIsPaused(newState);
     } catch (err) {
-      console.error("Failed to toggle pause:", err);
-    }
-  };
-
-  const generateMock = async () => {
-    try {
-      const res = await fetch(`${API_BASE}/generate_mock`, { method: 'POST' });
-      const data = await res.json();
-      if (data.success) {
-        setLogs(data.logs);
-      }
-    } catch (err) {
-      console.error("Failed to generate mock:", err);
+      console.error('Failed to toggle pause:', err);
     }
   };
 
@@ -83,37 +146,87 @@ const App = () => {
     try {
       const res = await fetch(`${API_BASE}/clear`, { method: 'POST' });
       const data = await res.json();
-      if (data.success) {
-        setLogs([]);
-      }
+      if (data.success) setLogs([]);
     } catch (err) {
-      console.error("Failed to clear logs:", err);
+      console.error('Failed to clear logs:', err);
     }
   };
 
-  // Compute statistics
+  const handleApiKeyChange = (val) => {
+    setApiKey(val);
+    sessionStorage.setItem('tf_api_key', val);
+  };
+
+  // ── Generate narratives locally via heuristics ────────────
+  const generateNarratives = async () => {
+    setNarrativeError(null);
+    setNarrativeLoading(true);
+
+    try {
+      const pending = logs
+        .map((log, i) => ({ ...log, _idx: i }))
+        .filter(log => !log.smart_narration);
+
+      if (pending.length === 0) {
+        setNarrativeLoading(false);
+        return;
+      }
+
+      const entries = pending.map(log => ({
+        index: log._idx,
+        application: log.application,
+        window: log.window,
+        start_time: log.start_time,
+        end_time: log.end_time,
+        duration_minutes: log.duration_minutes,
+      }));
+
+      // Simulate a small delay for UI effect
+      await new Promise(r => setTimeout(r, 600));
+
+      const narratives = generateHeuristicNarratives(entries);
+
+      const updated = [...logs];
+      for (const item of narratives) {
+        updated[item.index] = {
+          ...updated[item.index],
+          smart_narration: true,
+          summary: item.summary || '',
+          description: item.description || '',
+          commentary: item.commentary || '',
+          ai_generated_text: item.summary || '',
+        };
+      }
+      setLogs(updated);
+      await trySaveToServer(updated);
+
+    } catch (err) {
+      console.error('Narrative generation failed:', err);
+      setNarrativeError(err.message || 'Generation failed.');
+    } finally {
+      setNarrativeLoading(false);
+    }
+  };
+
+  // ── Statistics ────────────────────────────────────────────────────────────────
   const today = moment().startOf('day');
   const todayLogs = logs.filter(log => moment(log.start_time).isSameOrAfter(today));
-  
-  const totalMinutesToday = todayLogs.reduce((acc, log) => acc + log.duration_minutes, 0);
-  
-  // App usage stats for Pie chart
+  const totalMinutesToday = todayLogs.reduce((acc, l) => acc + l.duration_minutes, 0);
+  const narratedCount = todayLogs.filter(l => l.smart_narration).length;
+  const allNarrated = todayLogs.length > 0 && narratedCount === todayLogs.length;
+
   const appStats = {};
   todayLogs.forEach(log => {
-    if (!appStats[log.application]) appStats[log.application] = 0;
-    appStats[log.application] += log.duration_minutes;
+    appStats[log.application] = (appStats[log.application] || 0) + log.duration_minutes;
   });
-  const pieData = Object.keys(appStats).map(app => ({
-    name: app,
-    value: Number(appStats[app].toFixed(2))
-  })).sort((a, b) => b.value - a.value).slice(0, 6);
+  const pieData = Object.keys(appStats)
+    .map(app => ({ name: app, value: Number(appStats[app].toFixed(2)) }))
+    .sort((a, b) => b.value - a.value).slice(0, 6);
 
-  // Timeline for Bar chart
   const timelineStats = {};
   todayLogs.forEach(log => {
     const hour = moment(log.start_time).format('HA');
-    if (!timelineStats[hour]) timelineStats[hour] = 0;
-    timelineStats[hour] += log.duration_minutes;
+    timelineStats[hour] = (timelineStats[hour] || 0) + log.duration_minutes;
   });
   const barData = Object.keys(timelineStats).map(hour => ({
     time: hour,
@@ -121,23 +234,21 @@ const App = () => {
   }));
 
   const formatDuration = (mins) => {
-    if (mins < 1) {
-      const secs = Math.round(mins * 60);
-      return `${secs}s`;
-    }
-    if (mins < 60) {
-      return `${mins.toFixed(1)}m`;
-    }
-    const h = Math.floor(mins / 60);
-    const m = Math.round(mins % 60);
-    return `${h}h ${m}m`;
+    if (mins < 1) return `${Math.round(mins * 60)}s`;
+    if (mins < 60) return `${mins.toFixed(1)}m`;
+    return `${Math.floor(mins / 60)}h ${Math.round(mins % 60)}m`;
   };
 
-  if (loading) return <div className="min-h-screen bg-slate-950 flex items-center justify-center text-white"><RefreshCw className="w-8 h-8 animate-spin text-blue-500" /></div>;
+  if (loading) return (
+    <div className="min-h-screen bg-slate-950 flex items-center justify-center">
+      <RefreshCw className="w-8 h-8 animate-spin text-blue-500" />
+    </div>
+  );
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-200 font-sans selection:bg-blue-500/30">
-      {/* Header */}
+
+      {/* ── Header ─────────────────────────────────────────────────────────── */}
       <header className="border-b border-slate-800 bg-slate-900/50 backdrop-blur-xl sticky top-0 z-50">
         <div className="max-w-7xl mx-auto px-6 h-20 flex items-center justify-between">
           <div className="flex items-center gap-4">
@@ -151,20 +262,17 @@ const App = () => {
               <p className="text-xs text-slate-500 font-medium tracking-wide">AUTOMATED DESKTOP LOGGER</p>
             </div>
           </div>
-          
           <div className="flex items-center gap-6">
             <div className="flex items-center gap-2 text-sm text-slate-400 bg-slate-800/50 py-1.5 px-3 rounded-full">
-              <RefreshCw className="w-4 h-4 animate-spin-slow" />
+              <RefreshCw className="w-4 h-4 animate-spin" />
               <span>Live Synced</span>
             </div>
-            
             <button
               onClick={togglePause}
-              className={`flex items-center gap-2 px-5 py-2.5 rounded-full font-medium transition-all duration-300 shadow-lg cursor-pointer ${
-                isPaused 
-                  ? 'bg-amber-500/10 text-amber-500 hover:bg-amber-500/20 border border-amber-500/20 shadow-amber-500/10' 
-                  : 'bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500/20 border border-emerald-500/20 shadow-emerald-500/10'
-              }`}
+              className={`flex items-center gap-2 px-5 py-2.5 rounded-full font-medium transition-all duration-300 shadow-lg cursor-pointer ${isPaused
+                ? 'bg-amber-500/10 text-amber-500 hover:bg-amber-500/20 border border-amber-500/20'
+                : 'bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500/20 border border-emerald-500/20'
+                }`}
             >
               {isPaused ? <Play className="w-4 h-4 fill-current" /> : <Pause className="w-4 h-4 fill-current" />}
               {isPaused ? 'Resume Tracking' : 'Pause Tracking'}
@@ -174,45 +282,56 @@ const App = () => {
       </header>
 
       <main className="max-w-7xl mx-auto px-6 py-8">
-        
-        {/* Top Stats Cards */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+
+        {/* ── Stat Cards ─────────────────────────────────────────────────────── */}
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 relative overflow-hidden group">
-            <div className="absolute top-0 right-0 w-32 h-32 bg-blue-500/5 rounded-full blur-2xl -mr-10 -mt-10 transition-transform group-hover:scale-150 duration-700"></div>
+            <div className="absolute top-0 right-0 w-32 h-32 bg-blue-500/5 rounded-full blur-2xl -mr-10 -mt-10 group-hover:scale-150 transition-transform duration-700" />
             <div className="flex justify-between items-start mb-4">
               <div>
                 <p className="text-slate-400 text-sm font-medium mb-1">Today's Focus Time</p>
                 <h2 className="text-4xl font-bold text-white">{formatDuration(totalMinutesToday)}</h2>
               </div>
-              <div className="p-3 bg-blue-500/10 rounded-xl">
-                <Clock className="w-6 h-6 text-blue-500" />
-              </div>
+              <div className="p-3 bg-blue-500/10 rounded-xl"><Clock className="w-6 h-6 text-blue-500" /></div>
             </div>
             <div className="flex items-center gap-2 text-sm text-emerald-400">
-              <CheckCircle2 className="w-4 h-4" />
-              <span>Auto-tracked seamlessly</span>
+              <CheckCircle2 className="w-4 h-4" /><span>Auto-tracked seamlessly</span>
             </div>
           </div>
 
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 relative overflow-hidden group">
-            <div className="absolute top-0 right-0 w-32 h-32 bg-purple-500/5 rounded-full blur-2xl -mr-10 -mt-10 transition-transform group-hover:scale-150 duration-700"></div>
+            <div className="absolute top-0 right-0 w-32 h-32 bg-purple-500/5 rounded-full blur-2xl -mr-10 -mt-10 group-hover:scale-150 transition-transform duration-700" />
             <div className="flex justify-between items-start mb-4">
               <div>
                 <p className="text-slate-400 text-sm font-medium mb-1">Active Applications</p>
                 <h2 className="text-4xl font-bold text-white">{Object.keys(appStats).length}</h2>
               </div>
-              <div className="p-3 bg-purple-500/10 rounded-xl">
-                <Layout className="w-6 h-6 text-purple-500" />
-              </div>
+              <div className="p-3 bg-purple-500/10 rounded-xl"><Layout className="w-6 h-6 text-purple-500" /></div>
             </div>
             <div className="flex items-center gap-2 text-sm text-slate-400">
-              <Monitor className="w-4 h-4" />
-              <span>Across all desktops</span>
+              <Monitor className="w-4 h-4" /><span>Across all desktops</span>
             </div>
           </div>
 
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 relative overflow-hidden group">
-            <div className="absolute top-0 right-0 w-32 h-32 bg-amber-500/5 rounded-full blur-2xl -mr-10 -mt-10 transition-transform group-hover:scale-150 duration-700"></div>
+            <div className="absolute top-0 right-0 w-32 h-32 bg-violet-500/5 rounded-full blur-2xl -mr-10 -mt-10 group-hover:scale-150 transition-transform duration-700" />
+            <div className="flex justify-between items-start mb-4">
+              <div>
+                <p className="text-slate-400 text-sm font-medium mb-1">Narrated Entries</p>
+                <h2 className="text-4xl font-bold text-white">
+                  {narratedCount}
+                  <span className="text-slate-500 text-2xl">/{todayLogs.length}</span>
+                </h2>
+              </div>
+              <div className="p-3 bg-violet-500/10 rounded-xl"><Sparkles className="w-6 h-6 text-violet-400" /></div>
+            </div>
+            <div className="flex items-center gap-2 text-sm text-slate-400">
+              <Sparkles className="w-4 h-4 text-violet-400" /><span>AI-generated context</span>
+            </div>
+          </div>
+
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 relative overflow-hidden group">
+            <div className="absolute top-0 right-0 w-32 h-32 bg-amber-500/5 rounded-full blur-2xl -mr-10 -mt-10 group-hover:scale-150 transition-transform duration-700" />
             <div className="flex justify-between items-start mb-4">
               <div>
                 <p className="text-slate-400 text-sm font-medium mb-1">Privacy Status</p>
@@ -224,48 +343,42 @@ const App = () => {
                 <Shield className={`w-6 h-6 ${isPaused ? 'text-amber-500' : 'text-emerald-500'}`} />
               </div>
             </div>
-            <div className="flex items-center gap-2 text-sm text-slate-400">
+            <div className="text-sm text-slate-400">
               {isPaused ? 'Recording stopped for privacy' : 'Capturing background activity'}
             </div>
           </div>
         </div>
 
-        {/* Navigation Tabs */}
+        {/* ── Tabs ───────────────────────────────────────────────────────────── */}
         <div className="flex items-center gap-6 border-b border-slate-800 mb-8">
-          <button 
-            onClick={() => setActiveTab('dashboard')}
-            className={`pb-4 px-2 text-sm font-medium transition-colors relative cursor-pointer ${activeTab === 'dashboard' ? 'text-white' : 'text-slate-400 hover:text-slate-200'}`}
-          >
-            Analytics Dashboard
-            {activeTab === 'dashboard' && <div className="absolute bottom-0 left-0 w-full h-0.5 bg-blue-500 rounded-t-full"></div>}
-          </button>
-          <button 
-            onClick={() => setActiveTab('logs')}
-            className={`pb-4 px-2 text-sm font-medium transition-colors relative cursor-pointer ${activeTab === 'logs' ? 'text-white' : 'text-slate-400 hover:text-slate-200'}`}
-          >
-            Review Logs
-            {activeTab === 'logs' && <div className="absolute bottom-0 left-0 w-full h-0.5 bg-blue-500 rounded-t-full"></div>}
-          </button>
+          {['dashboard', 'logs'].map(tab => (
+            <button
+              key={tab}
+              onClick={() => setActiveTab(tab)}
+              className={`pb-4 px-2 text-sm font-medium transition-colors relative cursor-pointer ${activeTab === tab ? 'text-white' : 'text-slate-400 hover:text-slate-200'
+                }`}
+            >
+              {tab === 'dashboard' ? 'Analytics Dashboard' : 'Review Logs'}
+              {activeTab === tab && <div className="absolute bottom-0 left-0 w-full h-0.5 bg-blue-500 rounded-t-full" />}
+            </button>
+          ))}
         </div>
 
-        {/* Tab Content */}
+        {/* ── Tab Content ─────────────────────────────────────────────────────── */}
         {logs.length === 0 ? (
           <div className="bg-slate-900/50 border border-slate-800 rounded-2xl p-12 text-center max-w-2xl mx-auto my-8 backdrop-blur-xl">
             <Activity className="w-16 h-16 text-blue-500 mx-auto mb-6 animate-pulse" />
             <h3 className="text-2xl font-bold text-white mb-3">No Active Window Logs Yet</h3>
             <p className="text-slate-400 text-sm mb-8 leading-relaxed max-w-md mx-auto">
-              TrackFlow's API is active, but it hasn't recorded any local windows yet. This is common in remote sessions, WSL without active displays, or headless VMs.
+              No desktop activity has been recorded yet. Keep the tracker running in the background.
             </p>
-            <button
-              onClick={generateMock}
-              className="bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-500 hover:to-purple-500 text-white font-semibold px-8 py-3.5 rounded-xl transition-all duration-300 shadow-xl shadow-blue-500/10 cursor-pointer"
-            >
+            <button disabled className="bg-gradient-to-r from-blue-600/50 to-purple-600/50 text-white/50 font-semibold px-8 py-3.5 rounded-xl cursor-not-allowed">
               Generate Realistic Demo Logs
             </button>
           </div>
+
         ) : activeTab === 'dashboard' ? (
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            {/* Chart 1 */}
             <div className="lg:col-span-2 bg-slate-900 border border-slate-800 rounded-2xl p-6">
               <h3 className="text-lg font-semibold mb-6 flex items-center gap-2">
                 <Activity className="w-5 h-5 text-blue-500" /> Activity Timeline
@@ -274,56 +387,40 @@ const App = () => {
                 <ResponsiveContainer width="100%" height="100%">
                   <BarChart data={barData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} />
-                    <XAxis dataKey="time" stroke="#64748b" tick={{fill: '#64748b', fontSize: 12}} axisLine={false} tickLine={false} />
-                    <YAxis stroke="#64748b" tick={{fill: '#64748b', fontSize: 12}} axisLine={false} tickLine={false} />
-                    <Tooltip 
-                      cursor={{fill: '#1e293b'}} 
-                      contentStyle={{backgroundColor: '#0f172a', borderColor: '#1e293b', borderRadius: '8px', color: '#f8fafc'}}
-                      itemStyle={{color: '#e2e8f0'}}
+                    <XAxis dataKey="time" stroke="#64748b" tick={{ fill: '#64748b', fontSize: 12 }} axisLine={false} tickLine={false} />
+                    <YAxis stroke="#64748b" tick={{ fill: '#64748b', fontSize: 12 }} axisLine={false} tickLine={false} />
+                    <Tooltip
+                      cursor={{ fill: '#1e293b' }}
+                      contentStyle={{ backgroundColor: '#0f172a', borderColor: '#1e293b', borderRadius: '8px', color: '#f8fafc' }}
+                      itemStyle={{ color: '#e2e8f0' }}
                     />
-                    <Bar dataKey="minutes" fill="#3b82f6" radius={[4, 4, 0, 0]}>
-                      {barData.map((entry, index) => (
-                        <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
-                      ))}
+                    <Bar dataKey="minutes" radius={[4, 4, 0, 0]}>
+                      {barData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
                     </Bar>
                   </BarChart>
                 </ResponsiveContainer>
               </div>
             </div>
 
-            {/* Chart 2 */}
             <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6">
               <h3 className="text-lg font-semibold mb-6 flex items-center gap-2">
                 <PieChart className="w-5 h-5 text-purple-500" /> App Distribution
               </h3>
-              <div className="h-60 flex items-center justify-center">
+              <div className="h-60">
                 <ResponsiveContainer width="100%" height="100%">
-                  <PieChart>
-                    <Pie
-                      data={pieData}
-                      cx="50%"
-                      cy="50%"
-                      innerRadius={60}
-                      outerRadius={80}
-                      paddingAngle={5}
-                      dataKey="value"
-                      stroke="none"
-                    >
-                      {pieData.map((entry, index) => (
-                        <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
-                      ))}
+                  <RechartsPieChart>
+                    <Pie data={pieData} cx="50%" cy="50%" innerRadius={60} outerRadius={80} paddingAngle={5} dataKey="value" stroke="none">
+                      {pieData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
                     </Pie>
-                    <Tooltip 
-                      contentStyle={{backgroundColor: '#0f172a', borderColor: '#1e293b', borderRadius: '8px', color: '#f8fafc'}}
-                    />
-                  </PieChart>
+                    <Tooltip contentStyle={{ backgroundColor: '#0f172a', borderColor: '#1e293b', borderRadius: '8px', color: '#f8fafc' }} />
+                  </RechartsPieChart>
                 </ResponsiveContainer>
               </div>
               <div className="mt-4 space-y-2">
-                {pieData.map((entry, index) => (
-                  <div key={index} className="flex items-center justify-between text-sm">
+                {pieData.map((entry, i) => (
+                  <div key={i} className="flex items-center justify-between text-sm">
                     <div className="flex items-center gap-2">
-                      <div className="w-3 h-3 rounded-full" style={{backgroundColor: COLORS[index % COLORS.length]}}></div>
+                      <div className="w-3 h-3 rounded-full" style={{ backgroundColor: COLORS[i % COLORS.length] }} />
                       <span className="text-slate-300 truncate max-w-[120px]">{entry.name}</span>
                     </div>
                     <span className="font-medium">{formatDuration(entry.value)}</span>
@@ -332,60 +429,130 @@ const App = () => {
               </div>
             </div>
           </div>
+
         ) : (
+          /* ── Logs Tab ─────────────────────────────────────────────────────── */
           <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden">
-            <div className="p-6 border-b border-slate-800 flex justify-between items-center">
-              <h3 className="text-lg font-semibold flex items-center gap-2">
-                <FileText className="w-5 h-5 text-blue-500" /> Review Generated Logs
-              </h3>
-              <div className="flex gap-3">
-                <button 
-                  onClick={clearLogs}
-                  className="border border-slate-700 hover:bg-slate-800 text-slate-300 px-4 py-2 rounded-lg text-sm font-medium transition-colors cursor-pointer"
+
+            {/* Toolbar */}
+            <div className="p-6 border-b border-slate-800 space-y-3">
+              <div className="flex flex-wrap gap-3 justify-between items-center">
+                <h3 className="text-lg font-semibold flex items-center gap-2">
+                  <FileText className="w-5 h-5 text-blue-500" /> Review Generated Logs
+                </h3>
+                <div className="flex flex-wrap gap-3 items-center">
+                  <button
+                    onClick={clearLogs}
+                    className="border border-slate-700 hover:bg-slate-800 text-slate-300 px-4 py-2 rounded-lg text-sm font-medium transition-colors cursor-pointer"
+                  >
+                    Clear All Logs
+                  </button>
+                  <button className="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors cursor-pointer">
+                    Approve Today's Logs
+                  </button>
+                </div>
+              </div>
+
+              {/* ── Narrative controls ─────────────────────────────────────── */}
+              <div className="flex flex-wrap items-center gap-3 pt-1">
+                {/* Generate button */}
+                <button
+                  onClick={generateNarratives}
+                  disabled={narrativeLoading || allNarrated}
+                  className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all ${narrativeLoading || allNarrated
+                    ? 'bg-violet-500/5 text-violet-400/40 border border-violet-500/10 cursor-not-allowed'
+                    : 'bg-violet-500/10 text-violet-400 border border-violet-500/20 hover:bg-violet-500/20 cursor-pointer'
+                    }`}
                 >
-                  Clear All Logs
+                  {narrativeLoading
+                    ? <><Loader2 className="w-4 h-4 animate-spin" /> Generating…</>
+                    : <><Sparkles className="w-4 h-4" /> {allNarrated ? 'All Narrated' : 'Generate Narratives'}</>}
                 </button>
-                <button className="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors cursor-pointer">
-                  Approve Today's Logs
-                </button>
+
+                {/* Error message */}
+                {narrativeError && (
+                  <div className="flex items-center gap-1.5 text-sm text-red-400 bg-red-500/10 border border-red-500/20 px-3 py-1.5 rounded-lg">
+                    <AlertCircle className="w-4 h-4 shrink-0" />
+                    {narrativeError}
+                  </div>
+                )}
               </div>
             </div>
+
+            {/* ── Table ──────────────────────────────────────────────────────── */}
             <div className="overflow-x-auto">
               <table className="w-full text-left border-collapse">
                 <thead>
                   <tr className="bg-slate-950/50 text-slate-400 text-sm">
-                    <th className="p-4 font-medium">Time</th>
+                    <th className="p-4 font-medium whitespace-nowrap">Time</th>
                     <th className="p-4 font-medium">Application</th>
-                    <th className="p-4 font-medium">Window Details</th>
+                    <th className="p-4 font-medium">Window</th>
+                    {/* Description column sits right beside Window */}
+                    <th className="p-4 font-medium">
+                      <span className="flex items-center gap-1.5">
+                        <Sparkles className="w-3.5 h-3.5 text-violet-400" />
+                        Description
+                      </span>
+                    </th>
                     <th className="p-4 font-medium">Duration</th>
                     <th className="p-4 font-medium">Status</th>
                   </tr>
                 </thead>
                 <tbody className="text-sm divide-y divide-slate-800">
                   {todayLogs.slice().reverse().map((log, i) => (
-                    <tr key={i} className="hover:bg-slate-800/30 transition-colors">
+                    <tr key={i} className="hover:bg-slate-800/30 transition-colors align-top">
+
                       <td className="p-4 whitespace-nowrap text-slate-300">
-                        {moment(log.start_time).format('hh:mm A')} - {moment(log.end_time).format('hh:mm A')}
+                        {moment(log.start_time).format('hh:mm A')}<br />
+                        <span className="text-slate-500 text-xs">→ {moment(log.end_time).format('hh:mm A')}</span>
                       </td>
-                      <td className="p-4 font-medium text-white">
-                        {log.application}
+
+                      <td className="p-4 font-medium text-white">{log.application}</td>
+
+                      {/* Window title */}
+                      <td className="p-4 text-slate-400 max-w-[180px]">
+                        <span className="block truncate" title={log.window}>{log.window}</span>
                       </td>
-                      <td className="p-4 text-slate-400 max-w-xs truncate">
-                        {log.window}
+
+                      {/* ── Description column ──────────────────────────────── */}
+                      <td className="p-4 max-w-xs">
+                        {log.smart_narration ? (
+                          <div className="space-y-1">
+                            <p className="text-slate-200 text-sm leading-snug">{log.description}</p>
+                            {log.commentary && (
+                              <p className="text-slate-500 text-xs italic">{log.commentary}</p>
+                            )}
+                          </div>
+                        ) : narrativeLoading ? (
+                          <span className="flex items-center gap-1.5 text-slate-500 text-xs">
+                            <Loader2 className="w-3 h-3 animate-spin" /> generating…
+                          </span>
+                        ) : (
+                          <span className="text-slate-600 text-xs">—</span>
+                        )}
                       </td>
-                      <td className="p-4 font-mono text-slate-300">
+
+                      <td className="p-4 font-mono text-slate-300 whitespace-nowrap">
                         {formatDuration(log.duration_minutes)}
                       </td>
+
                       <td className="p-4">
-                        <span className="bg-blue-500/10 text-blue-400 border border-blue-500/20 px-2 py-1 rounded text-xs font-medium">
-                          Auto-logged
-                        </span>
+                        {log.smart_narration ? (
+                          <span className="inline-flex items-center gap-1 bg-violet-500/10 text-violet-400 border border-violet-500/20 px-2 py-1 rounded text-xs font-medium whitespace-nowrap">
+                            <Sparkles className="w-3 h-3" /> Narrated
+                          </span>
+                        ) : (
+                          <span className="bg-blue-500/10 text-blue-400 border border-blue-500/20 px-2 py-1 rounded text-xs font-medium whitespace-nowrap">
+                            Auto-logged
+                          </span>
+                        )}
                       </td>
                     </tr>
                   ))}
+
                   {todayLogs.length === 0 && (
                     <tr>
-                      <td colSpan="5" className="p-8 text-center text-slate-500">
+                      <td colSpan={6} className="p-8 text-center text-slate-500">
                         No activity recorded yet today. Keep this tracker running in the background.
                       </td>
                     </tr>
@@ -395,7 +562,6 @@ const App = () => {
             </div>
           </div>
         )}
-
       </main>
     </div>
   );

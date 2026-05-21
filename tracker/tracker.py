@@ -73,50 +73,67 @@ def load_logs():
 
 def save_logs(logs):
     os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
-    with open(LOG_FILE, "w") as f:
-        json.dump(logs, f, indent=2)
-
-def generate_mock_data():
-    now = datetime.now()
-    mock_logs = [
-        {
-            "application": "Visual Studio Code",
-            "window": "tracker.py - activity-tracker",
-            "start_time": (now - timedelta(hours=5)).isoformat(),
-            "end_time": (now - timedelta(hours=4, minutes=15)).isoformat(),
-            "duration_minutes": 45.0
-        },
-        {
-            "application": "Google Chrome",
-            "window": "Live Cricket: India vs England 2nd Test - Match Streaming - Disney+ Hotstar",
-            "start_time": (now - timedelta(hours=4, minutes=10)).isoformat(),
-            "end_time": (now - timedelta(hours=2, minutes=40)).isoformat(),
-            "duration_minutes": 90.0
-        },
-        {
-            "application": "Terminal",
-            "window": "git commit -m \"feat: active window tracking hook\"",
-            "start_time": (now - timedelta(hours=2, minutes=35)).isoformat(),
-            "end_time": (now - timedelta(hours=2, minutes=15)).isoformat(),
-            "duration_minutes": 20.0
-        },
-        {
-            "application": "Google Chrome",
-            "window": "T20 Cricket Match Highlights & Analysis - YouTube",
-            "start_time": (now - timedelta(hours=2, minutes=10)).isoformat(),
-            "end_time": (now - timedelta(hours=1, minutes=40)).isoformat(),
-            "duration_minutes": 30.0
-        },
-        {
-            "application": "Visual Studio Code",
-            "window": "App.jsx - activity-tracker",
-            "start_time": (now - timedelta(hours=1, minutes=35)).isoformat(),
-            "end_time": (now - timedelta(minutes=15)).isoformat(),
-            "duration_minutes": 80.0
+    
+    ordered_logs = []
+    for log in logs:
+        ordered_log = {
+            "application": log.get("application"),
+            "window": log.get("window"),
+            "description": log.get("description"),
+            "start_time": log.get("start_time"),
+            "end_time": log.get("end_time"),
+            "duration_minutes": log.get("duration_minutes")
         }
-    ]
-    save_logs(mock_logs)
-    return mock_logs
+        # Append remaining keys (e.g., smart_narration, summary)
+        for k, v in log.items():
+            if k not in ordered_log and k not in ["commentary", "ai_generated_text"]:
+                ordered_log[k] = v
+        ordered_logs.append(ordered_log)
+        
+    with open(LOG_FILE, "w") as f:
+        json.dump(ordered_logs, f, indent=2)
+
+# def generate_mock_data():
+#     now = datetime.now()
+#     mock_logs = [
+#         {
+#             "application": "Visual Studio Code",
+#             "window": "tracker.py - activity-tracker",
+#             "start_time": (now - timedelta(hours=5)).isoformat(),
+#             "end_time": (now - timedelta(hours=4, minutes=15)).isoformat(),
+#             "duration_minutes": 45.0
+#         },
+#         {
+#             "application": "Google Chrome",
+#             "window": "Live Cricket: India vs England 2nd Test - Match Streaming - Disney+ Hotstar",
+#             "start_time": (now - timedelta(hours=4, minutes=10)).isoformat(),
+#             "end_time": (now - timedelta(hours=2, minutes=40)).isoformat(),
+#             "duration_minutes": 90.0
+#         },
+#         {
+#             "application": "Terminal",
+#             "window": "git commit -m \"feat: active window tracking hook\"",
+#             "start_time": (now - timedelta(hours=2, minutes=35)).isoformat(),
+#             "end_time": (now - timedelta(hours=2, minutes=15)).isoformat(),
+#             "duration_minutes": 20.0
+#         },
+#         {
+#             "application": "Google Chrome",
+#             "window": "T20 Cricket Match Highlights & Analysis - YouTube",
+#             "start_time": (now - timedelta(hours=2, minutes=10)).isoformat(),
+#             "end_time": (now - timedelta(hours=1, minutes=40)).isoformat(),
+#             "duration_minutes": 30.0
+#         },
+#         {
+#             "application": "Visual Studio Code",
+#             "window": "App.jsx - activity-tracker",
+#             "start_time": (now - timedelta(hours=1, minutes=35)).isoformat(),
+#             "end_time": (now - timedelta(minutes=15)).isoformat(),
+#             "duration_minutes": 80.0
+#         }
+#     ]
+#     save_logs(mock_logs)
+#     return mock_logs
 
 def is_paused():
     if os.path.exists(PAUSE_FILE):
@@ -149,12 +166,16 @@ def track_activity():
                     end_time = datetime.now()
                     duration = (end_time - start_time).total_seconds() / 60.0
                     if duration >= 0.05:
+                        logs = load_logs() # Reload from disk to prevent memory overwrite
                         logs.append({
                             "application": current_app,
                             "window": current_window,
                             "start_time": start_time.isoformat(),
                             "end_time": end_time.isoformat(),
-                            "duration_minutes": round(duration, 2)
+                            "duration_minutes": round(duration, 2),
+                            "smart_narration": False,
+                            "summary": None,
+                            "description": None
                         })
                         save_logs(logs)
                     current_app = None
@@ -174,12 +195,15 @@ def track_activity():
                     if duration >= 0.05: # At least 3 seconds
                         logs = load_logs() # Reload from disk to prevent memory overwrite
                         logs.append({
-                            "application": current_app,
-                            "window": current_window,
-                            "start_time": start_time.isoformat(),
-                            "end_time": now.isoformat(),
-                            "duration_minutes": round(duration, 2)
-                        })
+    "application": current_app,
+    "window": current_window,
+    "start_time": start_time.isoformat(),
+    "end_time": now.isoformat(),
+    "duration_minutes": round(duration, 2),
+    "smart_narration": False,
+    "summary": None,
+    "description": None
+})
                         save_logs(logs)
                         print(f"Logged: {current_app} - {current_window} ({round(duration, 2)}m)")
                 
@@ -239,13 +263,19 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.send_header('Content-type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps({"success": True, "paused": paused}).encode())
-        elif self.path == '/api/generate_mock':
-            logs = generate_mock_data()
+        elif self.path == '/api/update_logs':
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            data = json.loads(post_data.decode('utf-8'))
+            
+            logs = data.get("logs", [])
+            save_logs(logs)
+            
             self.send_response(200)
             self._send_cors_headers()
             self.send_header('Content-type', 'application/json')
             self.end_headers()
-            self.wfile.write(json.dumps({"success": True, "logs": logs}).encode())
+            self.wfile.write(json.dumps({"success": True}).encode())
         elif self.path == '/api/clear':
             save_logs([])
             self.send_response(200)
@@ -258,9 +288,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
 def run_server():
-    server_address = ('', 5001)
+    server_address = ('',5173)
     httpd = HTTPServer(server_address, RequestHandler)
-    print("Starting local API server on port 5001...")
+    print("Starting local API server on port 5173...")
     httpd.serve_forever()
 
 if __name__ == "__main__":
