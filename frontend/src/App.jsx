@@ -6,12 +6,11 @@ import {
 import {
   Play, Pause, Activity, Clock, Layout, Monitor, Shield,
   RefreshCw, CheckCircle2, FileText, PieChart, Sparkles,
-  AlertCircle, Loader2, Eye, EyeOff
+  AlertCircle, Loader2, History, Calendar
 } from 'lucide-react';
 import moment from 'moment';
 
 const API_BASE = 'http://localhost:5173/api';
-const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
 
 const COLORS = ['#3b82f6', '#8b5cf6', '#ec4899', '#f43f5e', '#f59e0b', '#10b981', '#06b6d4'];
 
@@ -83,13 +82,12 @@ function generateHeuristicNarratives(entries) {
   });
 }
 
-// ── Try to persist narrated logs back to the local server (silent fail) ───────
-async function trySaveToServer(logs) {
+async function trySaveToServer(logs, dateStr) {
   try {
     await fetch(`${API_BASE}/update_logs`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ logs }),
+      body: JSON.stringify({ logs, date: dateStr }),
     });
   } catch (_) { /* server may not be running — that's fine */ }
 }
@@ -97,34 +95,78 @@ async function trySaveToServer(logs) {
 const App = () => {
   const [logs, setLogs] = useState([]);
   const [isPaused, setIsPaused] = useState(false);
+  const [pauseCount, setPauseCount] = useState(0);
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState('dashboard');
 
-  // Narrative generation state
-  const [apiKey, setApiKey] = useState(() => sessionStorage.getItem('tf_api_key') || '');
-  const [showKey, setShowKey] = useState(false);
+  const [availableDates, setAvailableDates] = useState([]);
+  const [selectedDate, setSelectedDate] = useState(() => moment().format('DD-MM-YYYY'));
+
+  // Narrative & History state
   const [narrativeLoading, setNarrativeLoading] = useState(false);
   const [narrativeError, setNarrativeError] = useState(null);
 
+  const [historyLogs, setHistoryLogs] = useState([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+
   useEffect(() => {
-    fetchData();
-    const interval = setInterval(fetchData, 5000);
-    return () => clearInterval(interval);
+    fetchDates();
   }, []);
+
+  useEffect(() => {
+    if (activeTab !== 'history') {
+      fetchData();
+      const interval = setInterval(fetchData, 5000);
+      return () => clearInterval(interval);
+    } else {
+      fetchHistoryData();
+    }
+  }, [selectedDate, activeTab]);
+
+  const fetchDates = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/dates`);
+      const data = await res.json();
+      if (data.dates && data.dates.length > 0) {
+        setAvailableDates(data.dates);
+      } else {
+        setAvailableDates([moment().format('DD-MM-YYYY')]);
+      }
+    } catch (err) {
+      console.error('Failed to fetch dates:', err);
+      setAvailableDates([moment().format('DD-MM-YYYY')]);
+    }
+  };
 
   const fetchData = async () => {
     try {
       const t = Date.now();
       const [logsRes, statusRes] = await Promise.all([
-        fetch(`${API_BASE}/logs?t=${t}`, { cache: 'no-store' }),
+        fetch(`${API_BASE}/logs?date=${selectedDate}&t=${t}`, { cache: 'no-store' }),
         fetch(`${API_BASE}/status?t=${t}`, { cache: 'no-store' })
       ]);
       setLogs(await logsRes.json());
-      setIsPaused((await statusRes.json()).paused);
+      const statusData = await statusRes.json();
+      setIsPaused(statusData.paused);
+      setPauseCount(statusData.pause_count || 0);
       setLoading(false);
     } catch (err) {
       console.error('Failed to fetch data:', err);
       setLoading(false);
+    }
+  };
+
+  const fetchHistoryData = async () => {
+    setHistoryLoading(true);
+    try {
+      // Fetching all logs combined from the python backend
+      const res = await fetch(`${API_BASE}/logs?t=${Date.now()}`, { cache: 'no-store' });
+      const data = await res.json();
+      setHistoryLogs(data);
+    } catch (err) {
+      console.error('Failed to fetch history:', err);
+    } finally {
+      setHistoryLoading(false);
     }
   };
 
@@ -144,7 +186,11 @@ const App = () => {
 
   const clearLogs = async () => {
     try {
-      const res = await fetch(`${API_BASE}/clear`, { method: 'POST' });
+      const res = await fetch(`${API_BASE}/clear`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ date: selectedDate })
+      });
       const data = await res.json();
       if (data.success) setLogs([]);
     } catch (err) {
@@ -152,12 +198,6 @@ const App = () => {
     }
   };
 
-  const handleApiKeyChange = (val) => {
-    setApiKey(val);
-    sessionStorage.setItem('tf_api_key', val);
-  };
-
-  // ── Generate narratives locally via heuristics ────────────
   const generateNarratives = async () => {
     setNarrativeError(null);
     setNarrativeLoading(true);
@@ -181,7 +221,6 @@ const App = () => {
         duration_minutes: log.duration_minutes,
       }));
 
-      // Simulate a small delay for UI effect
       await new Promise(r => setTimeout(r, 600));
 
       const narratives = generateHeuristicNarratives(entries);
@@ -198,7 +237,7 @@ const App = () => {
         };
       }
       setLogs(updated);
-      await trySaveToServer(updated);
+      await trySaveToServer(updated, selectedDate);
 
     } catch (err) {
       console.error('Narrative generation failed:', err);
@@ -208,16 +247,49 @@ const App = () => {
     }
   };
 
+  // ── Data Formatting ───────────────────────────────────────────────────────────
+  const formatDuration = (mins) => {
+    if (mins < 1) return `${Math.round(mins * 60)}s`;
+    if (mins < 60) return `${mins.toFixed(1)}m`;
+    return `${Math.floor(mins / 60)}h ${Math.round(mins % 60)}m`;
+  };
+
+  // Group History by Date with smart timestamp extraction fallback
+  const groupedHistory = historyLogs.reduce((acc, log) => {
+    let dateKey = log.date;
+
+    if (!dateKey && log.start_time) {
+      dateKey = moment(log.start_time).format('DD-MM-YYYY');
+    }
+
+    if (!dateKey) {
+      dateKey = "Unknown Date";
+    }
+
+    if (!acc[dateKey]) acc[dateKey] = [];
+    acc[dateKey].push(log);
+    return acc;
+  }, {});
+
+  // Sort dates descending (Newest day on top, oldest day at the bottom)
+  const sortedHistoryDates = Object.keys(groupedHistory).sort((a, b) => {
+    const timeA = new Date(groupedHistory[a][0]?.start_time).getTime() || 0;
+    const timeB = new Date(groupedHistory[b][0]?.start_time).getTime() || 0;
+
+    return timeB - timeA;
+  });
+
   // ── Statistics ────────────────────────────────────────────────────────────────
-  const today = moment().startOf('day');
-  const todayLogs = logs.filter(log => moment(log.start_time).isSameOrAfter(today));
+  const todayLogs = logs;
   const totalMinutesToday = todayLogs.reduce((acc, l) => acc + l.duration_minutes, 0);
   const narratedCount = todayLogs.filter(l => l.smart_narration).length;
   const allNarrated = todayLogs.length > 0 && narratedCount === todayLogs.length;
 
   const appStats = {};
   todayLogs.forEach(log => {
-    appStats[log.application] = (appStats[log.application] || 0) + log.duration_minutes;
+    if (log.application !== "System") {
+      appStats[log.application] = (appStats[log.application] || 0) + log.duration_minutes;
+    }
   });
   const pieData = Object.keys(appStats)
     .map(app => ({ name: app, value: Number(appStats[app].toFixed(2)) }))
@@ -225,21 +297,17 @@ const App = () => {
 
   const timelineStats = {};
   todayLogs.forEach(log => {
-    const hour = moment(log.start_time).format('HA');
-    timelineStats[hour] = (timelineStats[hour] || 0) + log.duration_minutes;
+    if (log.application !== "System") {
+      const hour = moment(log.start_time).format('HA');
+      timelineStats[hour] = (timelineStats[hour] || 0) + log.duration_minutes;
+    }
   });
   const barData = Object.keys(timelineStats).map(hour => ({
     time: hour,
     minutes: Number(timelineStats[hour].toFixed(2))
   }));
 
-  const formatDuration = (mins) => {
-    if (mins < 1) return `${Math.round(mins * 60)}s`;
-    if (mins < 60) return `${mins.toFixed(1)}m`;
-    return `${Math.floor(mins / 60)}h ${Math.round(mins % 60)}m`;
-  };
-
-  if (loading) return (
+  if (loading && activeTab !== 'history') return (
     <div className="min-h-screen bg-slate-950 flex items-center justify-center">
       <RefreshCw className="w-8 h-8 animate-spin text-blue-500" />
     </div>
@@ -263,6 +331,8 @@ const App = () => {
             </div>
           </div>
           <div className="flex items-center gap-6">
+            {/* Today Date Select Dropdown Menu Removed From Here */}
+
             <div className="flex items-center gap-2 text-sm text-slate-400 bg-slate-800/50 py-1.5 px-3 rounded-full">
               <RefreshCw className="w-4 h-4 animate-spin" />
               <span>Live Synced</span>
@@ -280,7 +350,6 @@ const App = () => {
           </div>
         </div>
       </header>
-
       <main className="max-w-7xl mx-auto px-6 py-8">
 
         {/* ── Stat Cards ─────────────────────────────────────────────────────── */}
@@ -289,7 +358,7 @@ const App = () => {
             <div className="absolute top-0 right-0 w-32 h-32 bg-blue-500/5 rounded-full blur-2xl -mr-10 -mt-10 group-hover:scale-150 transition-transform duration-700" />
             <div className="flex justify-between items-start mb-4">
               <div>
-                <p className="text-slate-400 text-sm font-medium mb-1">Today's Focus Time</p>
+                <p className="text-slate-400 text-sm font-medium mb-1">Focus Time</p>
                 <h2 className="text-4xl font-bold text-white">{formatDuration(totalMinutesToday)}</h2>
               </div>
               <div className="p-3 bg-blue-500/10 rounded-xl"><Clock className="w-6 h-6 text-blue-500" /></div>
@@ -344,61 +413,59 @@ const App = () => {
               </div>
             </div>
             <div className="text-sm text-slate-400">
-              {isPaused ? 'Recording stopped for privacy' : 'Capturing background activity'}
+              {pauseCount > 0 ? `Paused ${pauseCount} times` : (isPaused ? 'Recording stopped for privacy' : 'Capturing background activity')}
             </div>
           </div>
         </div>
 
         {/* ── Tabs ───────────────────────────────────────────────────────────── */}
         <div className="flex items-center gap-6 border-b border-slate-800 mb-8">
-          {['dashboard', 'logs'].map(tab => (
+          {[
+            { id: 'dashboard', label: 'Analytics Dashboard' },
+            { id: 'logs', label: 'Review Logs' },
+            { id: 'history', label: 'History Archive' }
+          ].map(tab => (
             <button
-              key={tab}
-              onClick={() => setActiveTab(tab)}
-              className={`pb-4 px-2 text-sm font-medium transition-colors relative cursor-pointer ${activeTab === tab ? 'text-white' : 'text-slate-400 hover:text-slate-200'
+              key={tab.id}
+              onClick={() => setActiveTab(tab.id)}
+              className={`pb-4 px-2 text-sm font-medium transition-colors relative cursor-pointer ${activeTab === tab.id ? 'text-white' : 'text-slate-400 hover:text-slate-200'
                 }`}
             >
-              {tab === 'dashboard' ? 'Analytics Dashboard' : 'Review Logs'}
-              {activeTab === tab && <div className="absolute bottom-0 left-0 w-full h-0.5 bg-blue-500 rounded-t-full" />}
+              {tab.label}
+              {activeTab === tab.id && <div className="absolute bottom-0 left-0 w-full h-0.5 bg-blue-500 rounded-t-full" />}
             </button>
           ))}
         </div>
 
         {/* ── Tab Content ─────────────────────────────────────────────────────── */}
-        {logs.length === 0 ? (
-          <div className="bg-slate-900/50 border border-slate-800 rounded-2xl p-12 text-center max-w-2xl mx-auto my-8 backdrop-blur-xl">
-            <Activity className="w-16 h-16 text-blue-500 mx-auto mb-6 animate-pulse" />
-            <h3 className="text-2xl font-bold text-white mb-3">No Active Window Logs Yet</h3>
-            <p className="text-slate-400 text-sm mb-8 leading-relaxed max-w-md mx-auto">
-              No desktop activity has been recorded yet. Keep the tracker running in the background.
-            </p>
-            <button disabled className="bg-gradient-to-r from-blue-600/50 to-purple-600/50 text-white/50 font-semibold px-8 py-3.5 rounded-xl cursor-not-allowed">
-              Generate Realistic Demo Logs
-            </button>
-          </div>
-
-        ) : activeTab === 'dashboard' ? (
+        {activeTab === 'dashboard' && (
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
             <div className="lg:col-span-2 bg-slate-900 border border-slate-800 rounded-2xl p-6">
               <h3 className="text-lg font-semibold mb-6 flex items-center gap-2">
                 <Activity className="w-5 h-5 text-blue-500" /> Activity Timeline
               </h3>
               <div className="h-72">
-                <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={barData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} />
-                    <XAxis dataKey="time" stroke="#64748b" tick={{ fill: '#64748b', fontSize: 12 }} axisLine={false} tickLine={false} />
-                    <YAxis stroke="#64748b" tick={{ fill: '#64748b', fontSize: 12 }} axisLine={false} tickLine={false} />
-                    <Tooltip
-                      cursor={{ fill: '#1e293b' }}
-                      contentStyle={{ backgroundColor: '#0f172a', borderColor: '#1e293b', borderRadius: '8px', color: '#f8fafc' }}
-                      itemStyle={{ color: '#e2e8f0' }}
-                    />
-                    <Bar dataKey="minutes" radius={[4, 4, 0, 0]}>
-                      {barData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
-                    </Bar>
-                  </BarChart>
-                </ResponsiveContainer>
+                {barData.length > 0 ? (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={barData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} />
+                      <XAxis dataKey="time" stroke="#64748b" tick={{ fill: '#64748b', fontSize: 12 }} axisLine={false} tickLine={false} />
+                      <YAxis stroke="#64748b" tick={{ fill: '#64748b', fontSize: 12 }} axisLine={false} tickLine={false} />
+                      <Tooltip
+                        cursor={{ fill: '#1e293b' }}
+                        contentStyle={{ backgroundColor: '#0f172a', borderColor: '#1e293b', borderRadius: '8px', color: '#f8fafc' }}
+                        itemStyle={{ color: '#e2e8f0' }}
+                      />
+                      <Bar dataKey="minutes" radius={[4, 4, 0, 0]}>
+                        {barData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
+                      </Bar>
+                    </BarChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <div className="h-full flex items-center justify-center text-slate-500 text-sm">
+                    No application activity to display on timeline yet.
+                  </div>
+                )}
               </div>
             </div>
 
@@ -407,14 +474,20 @@ const App = () => {
                 <PieChart className="w-5 h-5 text-purple-500" /> App Distribution
               </h3>
               <div className="h-60">
-                <ResponsiveContainer width="100%" height="100%">
-                  <RechartsPieChart>
-                    <Pie data={pieData} cx="50%" cy="50%" innerRadius={60} outerRadius={80} paddingAngle={5} dataKey="value" stroke="none">
-                      {pieData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
-                    </Pie>
-                    <Tooltip contentStyle={{ backgroundColor: '#0f172a', borderColor: '#1e293b', borderRadius: '8px', color: '#f8fafc' }} />
-                  </RechartsPieChart>
-                </ResponsiveContainer>
+                {pieData.length > 0 ? (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <RechartsPieChart>
+                      <Pie data={pieData} cx="50%" cy="50%" innerRadius={60} outerRadius={80} paddingAngle={5} dataKey="value" stroke="none">
+                        {pieData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
+                      </Pie>
+                      <Tooltip contentStyle={{ backgroundColor: '#0f172a', borderColor: '#1e293b', borderRadius: '8px', color: '#f8fafc' }} />
+                    </RechartsPieChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <div className="h-full flex items-center justify-center text-slate-500 text-sm">
+                    No application distribution to display.
+                  </div>
+                )}
               </div>
               <div className="mt-4 space-y-2">
                 {pieData.map((entry, i) => (
@@ -429,33 +502,27 @@ const App = () => {
               </div>
             </div>
           </div>
+        )}
 
-        ) : (
-          /* ── Logs Tab ─────────────────────────────────────────────────────── */
+        {/* ── Logs Tab ─────────────────────────────────────────────────────── */}
+        {activeTab === 'logs' && (
           <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden">
-
-            {/* Toolbar */}
             <div className="p-6 border-b border-slate-800 space-y-3">
               <div className="flex flex-wrap gap-3 justify-between items-center">
                 <h3 className="text-lg font-semibold flex items-center gap-2">
                   <FileText className="w-5 h-5 text-blue-500" /> Review Generated Logs
                 </h3>
                 <div className="flex flex-wrap gap-3 items-center">
-                  <button
-                    onClick={clearLogs}
-                    className="border border-slate-700 hover:bg-slate-800 text-slate-300 px-4 py-2 rounded-lg text-sm font-medium transition-colors cursor-pointer"
-                  >
+                  <button onClick={clearLogs} className="border border-slate-700 hover:bg-slate-800 text-slate-300 px-4 py-2 rounded-lg text-sm font-medium transition-colors cursor-pointer">
                     Clear All Logs
                   </button>
                   <button className="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors cursor-pointer">
-                    Approve Today's Logs
+                    Approve Logs
                   </button>
                 </div>
               </div>
 
-              {/* ── Narrative controls ─────────────────────────────────────── */}
               <div className="flex flex-wrap items-center gap-3 pt-1">
-                {/* Generate button */}
                 <button
                   onClick={generateNarratives}
                   disabled={narrativeLoading || allNarrated}
@@ -464,22 +531,16 @@ const App = () => {
                     : 'bg-violet-500/10 text-violet-400 border border-violet-500/20 hover:bg-violet-500/20 cursor-pointer'
                     }`}
                 >
-                  {narrativeLoading
-                    ? <><Loader2 className="w-4 h-4 animate-spin" /> Generating…</>
-                    : <><Sparkles className="w-4 h-4" /> {allNarrated ? 'All Narrated' : 'Generate Narratives'}</>}
+                  {narrativeLoading ? <><Loader2 className="w-4 h-4 animate-spin" /> Generating…</> : <><Sparkles className="w-4 h-4" /> {allNarrated ? 'All Narrated' : 'Generate Narratives'}</>}
                 </button>
-
-                {/* Error message */}
                 {narrativeError && (
                   <div className="flex items-center gap-1.5 text-sm text-red-400 bg-red-500/10 border border-red-500/20 px-3 py-1.5 rounded-lg">
-                    <AlertCircle className="w-4 h-4 shrink-0" />
-                    {narrativeError}
+                    <AlertCircle className="w-4 h-4 shrink-0" /> {narrativeError}
                   </div>
                 )}
               </div>
             </div>
 
-            {/* ── Table ──────────────────────────────────────────────────────── */}
             <div className="overflow-x-auto">
               <table className="w-full text-left border-collapse">
                 <thead>
@@ -487,12 +548,8 @@ const App = () => {
                     <th className="p-4 font-medium whitespace-nowrap">Time</th>
                     <th className="p-4 font-medium">Application</th>
                     <th className="p-4 font-medium">Window</th>
-                    {/* Description column sits right beside Window */}
                     <th className="p-4 font-medium">
-                      <span className="flex items-center gap-1.5">
-                        <Sparkles className="w-3.5 h-3.5 text-violet-400" />
-                        Description
-                      </span>
+                      <span className="flex items-center gap-1.5"><Sparkles className="w-3.5 h-3.5 text-violet-400" /> Description</span>
                     </th>
                     <th className="p-4 font-medium">Duration</th>
                     <th className="p-4 font-medium">Status</th>
@@ -501,41 +558,23 @@ const App = () => {
                 <tbody className="text-sm divide-y divide-slate-800">
                   {todayLogs.slice().reverse().map((log, i) => (
                     <tr key={i} className="hover:bg-slate-800/30 transition-colors align-top">
-
                       <td className="p-4 whitespace-nowrap text-slate-300">
                         {moment(log.start_time).format('hh:mm A')}<br />
                         <span className="text-slate-500 text-xs">→ {moment(log.end_time).format('hh:mm A')}</span>
                       </td>
-
                       <td className="p-4 font-medium text-white">{log.application}</td>
-
-                      {/* Window title */}
-                      <td className="p-4 text-slate-400 max-w-[180px]">
-                        <span className="block truncate" title={log.window}>{log.window}</span>
-                      </td>
-
-                      {/* ── Description column ──────────────────────────────── */}
+                      <td className="p-4 text-slate-400 max-w-[180px]"><span className="block truncate" title={log.window}>{log.window}</span></td>
                       <td className="p-4 max-w-xs">
                         {log.smart_narration ? (
                           <div className="space-y-1">
                             <p className="text-slate-200 text-sm leading-snug">{log.description}</p>
-                            {log.commentary && (
-                              <p className="text-slate-500 text-xs italic">{log.commentary}</p>
-                            )}
+                            {log.commentary && <p className="text-slate-500 text-xs italic">{log.commentary}</p>}
                           </div>
                         ) : narrativeLoading ? (
-                          <span className="flex items-center gap-1.5 text-slate-500 text-xs">
-                            <Loader2 className="w-3 h-3 animate-spin" /> generating…
-                          </span>
-                        ) : (
-                          <span className="text-slate-600 text-xs">—</span>
-                        )}
+                          <span className="flex items-center gap-1.5 text-slate-500 text-xs"><Loader2 className="w-3 h-3 animate-spin" /> generating…</span>
+                        ) : <span className="text-slate-600 text-xs">—</span>}
                       </td>
-
-                      <td className="p-4 font-mono text-slate-300 whitespace-nowrap">
-                        {formatDuration(log.duration_minutes)}
-                      </td>
-
+                      <td className="p-4 font-mono text-slate-300 whitespace-nowrap">{formatDuration(log.duration_minutes)}</td>
                       <td className="p-4">
                         {log.smart_narration ? (
                           <span className="inline-flex items-center gap-1 bg-violet-500/10 text-violet-400 border border-violet-500/20 px-2 py-1 rounded text-xs font-medium whitespace-nowrap">
@@ -549,17 +588,91 @@ const App = () => {
                       </td>
                     </tr>
                   ))}
-
                   {todayLogs.length === 0 && (
-                    <tr>
-                      <td colSpan={6} className="p-8 text-center text-slate-500">
-                        No activity recorded yet today. Keep this tracker running in the background.
-                      </td>
-                    </tr>
+                    <tr><td colSpan={6} className="p-8 text-center text-slate-500">No activity recorded for {selectedDate}.</td></tr>
                   )}
                 </tbody>
               </table>
             </div>
+          </div>
+        )}
+
+        {/* ── History Tab ──────────────────────────────────────────────────── */}
+        {activeTab === 'history' && (
+          <div className="space-y-6">
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 flex justify-between items-center">
+              <div>
+                <h3 className="text-lg font-semibold flex items-center gap-2">
+                  <History className="w-5 h-5 text-blue-500" /> Read-Only History Archive
+                </h3>
+                <p className="text-slate-400 text-sm mt-1">Viewing all immutable logged data across all recorded days.</p>
+              </div>
+            </div>
+
+            {historyLoading ? (
+              <div className="flex justify-center p-12">
+                <RefreshCw className="w-8 h-8 animate-spin text-blue-500" />
+              </div>
+            ) : sortedHistoryDates.length === 0 ? (
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-12 text-center">
+                <History className="w-12 h-12 text-slate-600 mx-auto mb-4" />
+                <h3 className="text-xl font-medium text-white mb-2">No History Found</h3>
+                <p className="text-slate-400 text-sm">There are no log files saved in the archive yet.</p>
+              </div>
+            ) : (
+              sortedHistoryDates.map(date => (
+                <div key={date} className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden">
+                  <div className="p-4 border-b border-slate-800 bg-slate-950/30 flex items-center gap-2">
+                    <Calendar className="w-4 h-4 text-slate-400" />
+                    <h4 className="font-semibold text-slate-200">{date}</h4>
+                    <span className="text-slate-500 text-xs ml-2">({groupedHistory[date].length} entries)</span>
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left border-collapse">
+                      <thead>
+                        <tr className="bg-slate-950/20 text-slate-400 text-xs uppercase tracking-wider">
+                          <th className="p-3 font-medium whitespace-nowrap">Time</th>
+                          <th className="p-3 font-medium">Application</th>
+                          <th className="p-3 font-medium">Window</th>
+                          {/* Restored Description Column */}
+                          <th className="p-3 font-medium">
+                            <span className="flex items-center gap-1.5">
+                              <Sparkles className="w-3.5 h-3.5 text-violet-400" /> Description
+                            </span>
+                          </th>
+                          <th className="p-3 font-medium">Duration</th>
+                        </tr>
+                      </thead>
+                      <tbody className="text-sm divide-y divide-slate-800/50">
+                        {groupedHistory[date].slice().reverse().map((log, i) => (
+                          <tr key={i} className="hover:bg-slate-800/20 transition-colors align-top">
+                            <td className="p-3 whitespace-nowrap text-slate-400">
+                              {moment(log.start_time).format('hh:mm A')} - {moment(log.end_time).format('hh:mm A')}
+                            </td>
+                            <td className="p-3 font-medium text-slate-300">{log.application}</td>
+                            <td className="p-3 text-slate-500 max-w-[150px] truncate" title={log.window}>{log.window}</td>
+
+                            {/* Render Description Text or blank indicator */}
+                            <td className="p-3 max-w-xs">
+                              {log.smart_narration ? (
+                                <div className="space-y-1">
+                                  <p className="text-slate-300 text-sm leading-snug">{log.description}</p>
+                                  {log.commentary && <p className="text-slate-500 text-xs italic">{log.commentary}</p>}
+                                </div>
+                              ) : (
+                                <span className="text-slate-600 text-xs">—</span>
+                              )}
+                            </td>
+
+                            <td className="p-3 font-mono text-slate-400 whitespace-nowrap">{formatDuration(log.duration_minutes)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              ))
+            )}
           </div>
         )}
       </main>
