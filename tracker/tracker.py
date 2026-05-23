@@ -4,33 +4,148 @@ import os
 import platform
 import subprocess
 import threading
+import math  # Added for mouse distance calculation
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import urllib.parse
+
+# Import pynput safely. Ensure you run: pip install pynput
+from pynput import mouse, keyboard
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 LOGS_DIR = os.path.join(BASE_DIR, "logs")
 PAUSE_FILE = os.path.abspath(os.path.join(BASE_DIR, "pause_status.json"))
 
 
+# ── Activity Metrics Hooks (Item 1 Implementation) ───────────────────────────
+
+_keystroke_count = 0
+_mouse_click_count = 0
+_mouse_distance_pixels = 0.0
+_last_mouse_pos = None
+metrics_lock = threading.Lock()
+
+def _on_press(key):
+    global _keystroke_count
+    with metrics_lock:
+        _keystroke_count += 1
+
+def _on_click(x, y, button, pressed):
+    global _mouse_click_count
+    if pressed:
+        with metrics_lock:
+            _mouse_click_count += 1
+
+def _on_move(x, y):
+    global _mouse_distance_pixels, _last_mouse_pos
+    with metrics_lock:
+        if _last_mouse_pos is not None:
+            dx = x - _last_mouse_pos[0]
+            dy = y - _last_mouse_pos[1]
+            _mouse_distance_pixels += math.sqrt(dx**2 + dy**2)
+        _last_mouse_pos = (x, y)
+
+def get_and_reset_metrics() -> dict:
+    """Collects gathered input metrics and resets counters for the next window track cycle."""
+    global _keystroke_count, _mouse_click_count, _mouse_distance_pixels
+    with metrics_lock:
+        metrics = {
+            "keystrokes": _keystroke_count,
+            "mouse_clicks": _mouse_click_count,
+            "mouse_distance_px": int(_mouse_distance_pixels)
+        }
+        _keystroke_count = 0
+        _mouse_click_count = 0
+        _mouse_distance_pixels = 0.0
+    return metrics
+
+def _evdev_listen(dev):
+    global _keystroke_count, _mouse_click_count, _mouse_distance_pixels
+    import evdev
+    last_abs_x = None
+    last_abs_y = None
+    try:
+        for event in dev.read_loop():
+            if event.type == evdev.ecodes.EV_KEY:
+                if event.value == 1: # Key down
+                    if event.code in [evdev.ecodes.BTN_LEFT, evdev.ecodes.BTN_RIGHT, evdev.ecodes.BTN_MIDDLE, evdev.ecodes.BTN_TOUCH]:
+                        with metrics_lock:
+                            _mouse_click_count += 1
+                    else:
+                        with metrics_lock:
+                            _keystroke_count += 1
+            elif event.type == evdev.ecodes.EV_REL:
+                if event.code in [evdev.ecodes.REL_X, evdev.ecodes.REL_Y]:
+                    with metrics_lock:
+                        _mouse_distance_pixels += abs(event.value)
+            elif event.type == evdev.ecodes.EV_ABS:
+                if event.code == evdev.ecodes.ABS_X:
+                    if last_abs_x is not None:
+                        with metrics_lock:
+                            _mouse_distance_pixels += abs(event.value - last_abs_x)
+                    last_abs_x = event.value
+                elif event.code == evdev.ecodes.ABS_Y:
+                    if last_abs_y is not None:
+                        with metrics_lock:
+                            _mouse_distance_pixels += abs(event.value - last_abs_y)
+                    last_abs_y = event.value
+    except Exception:
+        pass
+
+def start_input_listeners():
+    sys_name = platform.system()
+    if sys_name == "Linux":
+        try:
+            import evdev
+            devices = [evdev.InputDevice(path) for path in evdev.list_devices()]
+            started_any = False
+            for dev in devices:
+                caps = dev.capabilities()
+                is_keyboard = evdev.ecodes.EV_KEY in caps and evdev.ecodes.KEY_A in caps[evdev.ecodes.EV_KEY]
+                is_mouse = evdev.ecodes.EV_REL in caps or evdev.ecodes.EV_ABS in caps
+                
+                if is_keyboard or is_mouse:
+                    t = threading.Thread(target=_evdev_listen, args=(dev,), daemon=True)
+                    t.start()
+                    started_any = True
+            
+            if not started_any:
+                print("No evdev input devices found or accessible. Falling back to pynput...")
+                _start_pynput()
+            else:
+                print("Linux evdev tracking successfully initialized!")
+        except Exception as e:
+            print(f"Evdev setup failed: {e}. Falling back to pynput...")
+            _start_pynput()
+    else:
+        _start_pynput()
+
+def _start_pynput():
+    try:
+        from pynput import mouse, keyboard
+        mouse_listener = mouse.Listener(on_move=_on_move, on_click=_on_click)
+        keyboard_listener = keyboard.Listener(on_press=_on_press)
+        mouse_listener.start()
+        keyboard_listener.start()
+        print(f"{platform.system()} pynput tracking successfully initialized!")
+    except Exception as e:
+        print("Failed to start pynput listeners:", e)
+
+# Start listeners on spin up
+start_input_listeners()
+
+
 # ── Date helpers ──────────────────────────────────────────────────────────────
 
 def today_str():
-    """Returns today's date as DD-MM-YYYY  (used as filename / primary key)."""
     return datetime.now().strftime("%d-%m-%Y")
 
 def human_date(dt: datetime) -> str:
-    """Returns DD/MM/YY — the format shown to teachers / non-technical users."""
     return dt.strftime("%d/%m/%y")
 
 def get_log_file(dt: datetime = None) -> str:
-    """
-    Returns the full path to the daily log file for a given datetime.
-    File is named DD-MM-YYYY.json so it sorts and reads naturally.
-    """
     if dt is None:
         dt = datetime.now()
-    # Store files as DD-MM-YYYY.json but expose dates as DD/MM/YY
     return os.path.join(LOGS_DIR, dt.strftime("%d-%m-%Y") + ".json")
 
 
@@ -94,7 +209,6 @@ def get_active_window_title_and_app():
                 pass
         elif system == "Darwin":
             try:
-                # Use AppleScript via osascript to safely query System Events
                 script = '''
                 tell application "System Events"
                     try
@@ -122,8 +236,7 @@ def get_active_window_title_and_app():
             except Exception:
                 pass
                 
-        # Global fallback if all specific OS checks fail or throw errors
-        return "Unknown App", "Unknown Window"
+        return app_name, window_title
     except Exception:
         pass
 
@@ -133,7 +246,6 @@ def get_active_window_title_and_app():
 # ── Log I/O ───────────────────────────────────────────────────────────────────
 
 def load_logs(log_file: str = None) -> list:
-    """Load logs from a daily file. Defaults to today's file."""
     if log_file is None:
         log_file = get_log_file()
     if os.path.exists(log_file):
@@ -145,7 +257,6 @@ def load_logs(log_file: str = None) -> list:
     return []
 
 def load_all_logs() -> list:
-    """Aggregate every daily log file into one list (for the /api/logs endpoint)."""
     all_logs = []
     if not os.path.exists(LOGS_DIR):
         return all_logs
@@ -160,7 +271,6 @@ def load_all_logs() -> list:
     return all_logs
 
 def save_logs(logs: list, log_file: str = None):
-    """Save logs to a daily file. Defaults to today's file."""
     if log_file is None:
         log_file = get_log_file()
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
@@ -168,7 +278,7 @@ def save_logs(logs: list, log_file: str = None):
     ordered_logs = []
     for log in logs:
         ordered_log = {
-            "date":             log.get("date"),           # DD/MM/YY  — primary display key
+            "date":             log.get("date"),
             "application":      log.get("application"),
             "window":           log.get("window"),
             "description":      log.get("description"),
@@ -177,8 +287,8 @@ def save_logs(logs: list, log_file: str = None):
             "duration_minutes": log.get("duration_minutes"),
             "smart_narration":  log.get("smart_narration", False),
             "summary":          log.get("summary"),
+            "metrics":          log.get("metrics", {"keystrokes": 0, "mouse_clicks": 0, "mouse_distance_px": 0})
         }
-        # carry any extra keys the caller may have added
         for k, v in log.items():
             if k not in ordered_log:
                 ordered_log[k] = v
@@ -188,11 +298,11 @@ def save_logs(logs: list, log_file: str = None):
         json.dump(ordered_logs, f, indent=2)
 
 
-def _build_entry(app, window, start: datetime, end: datetime) -> dict:
-    """Build a single log entry dict with the human-readable date field."""
+def _build_entry(app, window, start: datetime, end: datetime, metrics: dict) -> dict:
+    """Build a log entry containing the active window tracking duration and raw peripheral telemetry."""
     duration = (end - start).total_seconds() / 60.0
     return {
-        "date":             human_date(start),          # e.g. "21/05/26"
+        "date":             human_date(start),
         "application":      app,
         "window":           window,
         "description":      None,
@@ -201,17 +311,17 @@ def _build_entry(app, window, start: datetime, end: datetime) -> dict:
         "duration_minutes": round(duration, 2),
         "smart_narration":  False,
         "summary":          None,
+        "metrics":          metrics  # Appended input telemetry directly into schema
     }
+
 
 # ── Pause helpers ─────────────────────────────────────────────────────────────
 
 def get_pause_data() -> dict:
-    """Reads the pause file and returns both the state and the counter."""
     if os.path.exists(PAUSE_FILE):
         try:
             with open(PAUSE_FILE, "r") as f:
                 data = json.load(f)
-                # Ensure defaults exist if reading an old version of the file
                 return {
                     "paused": data.get("paused", False),
                     "pause_count": data.get("pause_count", 0)
@@ -224,12 +334,9 @@ def is_paused() -> bool:
     return get_pause_data().get("paused", False)
 
 def set_paused(paused: bool) -> dict:
-    """Updates pause state, increments counter if paused, and returns new data."""
     os.makedirs(os.path.dirname(PAUSE_FILE), exist_ok=True)
-    
     current_data = get_pause_data()
     
-    # Only increment the counter if transitioning from False (running) to True (paused)
     if paused and not current_data["paused"]:
         current_data["pause_count"] += 1
         
@@ -239,22 +346,6 @@ def set_paused(paused: bool) -> dict:
         json.dump(current_data, f, indent=2)
         
     return current_data
-
-# # ── Pause helpers ─────────────────────────────────────────────────────────────
-
-# def is_paused() -> bool:
-#     if os.path.exists(PAUSE_FILE):
-#         try:
-#             with open(PAUSE_FILE, "r") as f:
-#                 return json.load(f).get("paused", False)
-#         except Exception:
-#             return False
-#     return False
-
-# def set_paused(paused: bool):
-#     os.makedirs(os.path.dirname(PAUSE_FILE), exist_ok=True)
-#     with open(PAUSE_FILE, "w") as f:
-#         json.dump({"paused": paused}, f)
 
 
 # ── Tracker loop ──────────────────────────────────────────────────────────────
@@ -273,9 +364,13 @@ def track_activity():
                     if duration >= 0.05:
                         log_file = get_log_file(start_time)
                         logs = load_logs(log_file)
-                        logs.append(_build_entry(current_app, current_window, start_time, end_time))
+                        activity_metrics = get_and_reset_metrics()
+                        logs.append(_build_entry(current_app, current_window, start_time, end_time, activity_metrics))
                         save_logs(logs, log_file)
                     current_app = None
+                else:
+                    # Keep clearing out peripheral metrics while paused so they don't leak into the next cycle
+                    get_and_reset_metrics()
                 time.sleep(2)
                 continue
 
@@ -290,12 +385,12 @@ def track_activity():
                 if current_app is not None:
                     duration = (now - start_time).total_seconds() / 60.0
                     if duration >= 0.05:
-                        # Use start_time to pick the correct daily file (handles midnight crossover)
                         log_file = get_log_file(start_time)
                         logs = load_logs(log_file)
-                        logs.append(_build_entry(current_app, current_window, start_time, now))
+                        activity_metrics = get_and_reset_metrics()
+                        logs.append(_build_entry(current_app, current_window, start_time, now, activity_metrics))
                         save_logs(logs, log_file)
-                        print(f"[{human_date(start_time)}] Logged: {current_app} – {current_window} ({round(duration,2)}m)")
+                        print(f"[{human_date(start_time)}] Logged: {current_app} – {current_window} ({round(duration,2)}m) | Inputs: {activity_metrics}")
 
                 current_app = app
                 current_window = window
@@ -311,7 +406,7 @@ def track_activity():
 
 class RequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        pass  # suppress noisy access log
+        pass
 
     def _send_cors_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -330,7 +425,6 @@ class RequestHandler(BaseHTTPRequestHandler):
         params = urllib.parse.parse_qs(parsed.query)
 
         if parsed.path.startswith("/api/logs"):
-            # Optional ?date=DD/MM/YY to fetch a single day
             date_param = params.get("date", [None])[0]
             if date_param:
                 normalized = date_param.replace("/", "-")
@@ -346,7 +440,6 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(logs).encode())
 
         elif parsed.path.startswith("/api/dates"):
-            # Returns list of available log dates  e.g. ["21-05-2026", "22-05-2026"]
             dates = []
             if os.path.exists(LOGS_DIR):
                 dates = sorted(
@@ -354,7 +447,6 @@ class RequestHandler(BaseHTTPRequestHandler):
                     for f in os.listdir(LOGS_DIR)
                     if f.endswith(".json")
                 )
-            # Convert dash filenames to slash format for UI
             dates = [d.replace("-", "/") for d in dates]
             self.send_response(200)
             self._send_cors_headers()
@@ -376,28 +468,25 @@ class RequestHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         content_length = int(self.headers.get("Content-Length", 0))
         post_data = self.rfile.read(content_length)
+        parsed_path = urllib.parse.urlparse(self.path)
 
-        if self.path == "/api/pause":
+        if parsed_path.path == "/api/pause":
             data = json.loads(post_data.decode("utf-8"))
             paused = data.get("paused", False)
             set_paused(paused)
             self._json_response({"success": True, "paused": paused})
 
-        elif self.path == "/api/update_logs":
+        elif parsed_path.path == "/api/update_logs":
             data = json.loads(post_data.decode("utf-8"))
             logs = data.get("logs", [])
-            # Optional ?date=DD-MM-YYYY in the URL
-            parsed = urllib.parse.urlparse(self.path)
-            params = urllib.parse.parse_qs(parsed.query)
-            # Extract date param and normalize
+            params = urllib.parse.parse_qs(parsed_path.query)
             date_param = params.get("date", [None])[0]
             normalized = date_param.replace("/", "-") if date_param else None
             log_file = os.path.join(LOGS_DIR, f"{normalized}.json") if normalized else get_log_file()
             save_logs(logs, log_file)
             self._json_response({"success": True})
 
-        elif self.path == "/api/clear":
-            # Clears TODAY's log only (never touches historical files)
+        elif parsed_path.path == "/api/clear":
             save_logs([], get_log_file())
             self._json_response({"success": True, "logs": []})
 
