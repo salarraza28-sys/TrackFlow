@@ -14,7 +14,7 @@ from pynput import mouse, keyboard
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 LOGS_DIR = os.path.join(BASE_DIR, "logs")
-PAUSE_FILE = os.path.abspath(os.path.join(BASE_DIR, "pause_status.json"))
+
 
 
 # ── Activity Metrics Hooks (Item 1 Implementation) ───────────────────────────
@@ -62,33 +62,120 @@ def get_and_reset_metrics() -> dict:
 def _evdev_listen(dev):
     global _keystroke_count, _mouse_click_count, _mouse_distance_pixels
     import evdev
+    import time
+    
+    caps = dev.capabilities()
+    has_keys = evdev.ecodes.EV_KEY in caps
+    key_codes = caps.get(evdev.ecodes.EV_KEY, [])
+    
+    is_keyboard_device = has_keys and (evdev.ecodes.KEY_A in key_codes)
+    has_btn_touch = has_keys and (evdev.ecodes.BTN_TOUCH in key_codes)
+    
+    has_abs_x = (evdev.ecodes.EV_ABS in caps) and (evdev.ecodes.ABS_X in caps[evdev.ecodes.EV_ABS])
+    has_abs_y = (evdev.ecodes.EV_ABS in caps) and (evdev.ecodes.ABS_Y in caps[evdev.ecodes.EV_ABS])
+    
+    # Scale factors for absolute coordinates (touchpad/touchscreen)
+    scale_x = 1.0
+    scale_y = 1.0
+    if has_abs_x:
+        abs_info_x = dev.absinfo(evdev.ecodes.ABS_X)
+        range_x = abs_info_x.max - abs_info_x.min
+        if range_x > 0:
+            scale_x = 1920.0 / range_x
+    if has_abs_y:
+        abs_info_y = dev.absinfo(evdev.ecodes.ABS_Y)
+        range_y = abs_info_y.max - abs_info_y.min
+        if range_y > 0:
+            scale_y = 1080.0 / range_y
+
     last_abs_x = None
     last_abs_y = None
+    
+    # Tracking touch state for absolute devices to avoid jumps and detect tap-to-clicks
+    is_touching = not has_btn_touch
+    touch_start_time = None
+    touch_start_x = None
+    touch_start_y = None
+
     try:
         for event in dev.read_loop():
             if event.type == evdev.ecodes.EV_KEY:
-                if event.value == 1: # Key down
-                    if event.code in [evdev.ecodes.BTN_LEFT, evdev.ecodes.BTN_RIGHT, evdev.ecodes.BTN_MIDDLE, evdev.ecodes.BTN_TOUCH]:
+                # Track mouse buttons
+                if event.code in [evdev.ecodes.BTN_LEFT, evdev.ecodes.BTN_RIGHT, evdev.ecodes.BTN_MIDDLE]:
+                    if event.value == 1: # Key down
                         with metrics_lock:
                             _mouse_click_count += 1
-                    else:
+                
+                # Track touchpad touch/tap heuristic
+                elif event.code == evdev.ecodes.BTN_TOUCH:
+                    if event.value == 1:
+                        is_touching = True
+                        touch_start_time = time.time()
+                        touch_start_x = last_abs_x
+                        touch_start_y = last_abs_y
+                    elif event.value == 0:
+                        is_touching = False
+                        
+                        # Tap-to-click heuristic: short duration, minimal movement
+                        if touch_start_time is not None:
+                            duration = time.time() - touch_start_time
+                            curr_x = last_abs_x if last_abs_x is not None else touch_start_x
+                            curr_y = last_abs_y if last_abs_y is not None else touch_start_y
+                            
+                            dist_x = abs(curr_x - touch_start_x) if (curr_x is not None and touch_start_x is not None) else 0
+                            dist_y = abs(curr_y - touch_start_y) if (curr_y is not None and touch_start_y is not None) else 0
+                            
+                            # Convert dist to scaled pixels
+                            scaled_dist_x = dist_x * scale_x
+                            scaled_dist_y = dist_y * scale_y
+                            
+                            # Tap threshold: < 250ms and moved less than 15 scaled pixels
+                            if duration < 0.25 and scaled_dist_x < 15 and scaled_dist_y < 15:
+                                with metrics_lock:
+                                    _mouse_click_count += 1
+                                    
+                        last_abs_x = None
+                        last_abs_y = None
+                        touch_start_time = None
+                        touch_start_x = None
+                        touch_start_y = None
+                
+                # Other keys (keyboard)
+                elif is_keyboard_device:
+                    if event.code < 0x100 and event.value == 1: # Key down
                         with metrics_lock:
                             _keystroke_count += 1
+                            
             elif event.type == evdev.ecodes.EV_REL:
-                if event.code in [evdev.ecodes.REL_X, evdev.ecodes.REL_Y]:
+                # Relative motion (standard mouse)
+                if event.code == evdev.ecodes.REL_X:
                     with metrics_lock:
                         _mouse_distance_pixels += abs(event.value)
+                elif event.code == evdev.ecodes.REL_Y:
+                    with metrics_lock:
+                        _mouse_distance_pixels += abs(event.value)
+                        
             elif event.type == evdev.ecodes.EV_ABS:
-                if event.code == evdev.ecodes.ABS_X:
-                    if last_abs_x is not None:
-                        with metrics_lock:
-                            _mouse_distance_pixels += abs(event.value - last_abs_x)
-                    last_abs_x = event.value
-                elif event.code == evdev.ecodes.ABS_Y:
-                    if last_abs_y is not None:
-                        with metrics_lock:
-                            _mouse_distance_pixels += abs(event.value - last_abs_y)
-                    last_abs_y = event.value
+                # Absolute motion (touchpad/touchscreen)
+                if is_touching:
+                    if event.code == evdev.ecodes.ABS_X:
+                        # Set initial coordinates when first event arrives
+                        if touch_start_x is None:
+                            touch_start_x = event.value
+                        if last_abs_x is not None:
+                            dx = event.value - last_abs_x
+                            with metrics_lock:
+                                _mouse_distance_pixels += abs(dx) * scale_x
+                        last_abs_x = event.value
+                    elif event.code == evdev.ecodes.ABS_Y:
+                        # Set initial coordinates when first event arrives
+                        if touch_start_y is None:
+                            touch_start_y = event.value
+                        if last_abs_y is not None:
+                            dy = event.value - last_abs_y
+                            with metrics_lock:
+                                _mouse_distance_pixels += abs(dy) * scale_y
+                        last_abs_y = event.value
     except Exception:
         pass
 
@@ -245,35 +332,42 @@ def get_active_window_title_and_app():
 
 # ── Log I/O ───────────────────────────────────────────────────────────────────
 
-def load_logs(log_file: str = None) -> list:
-    if log_file is None:
-        log_file = get_log_file()
+def _load_file_data(log_file: str) -> dict:
+    """Load raw file data, handling both old array format and new object format."""
     if os.path.exists(log_file):
         try:
             with open(log_file, "r") as f:
-                return json.load(f)
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+                # Migrate old array format
+                return {"paused": False, "pause_count": 0, "logs": data}
         except Exception:
-            return []
-    return []
+            pass
+    return {"paused": False, "pause_count": 0, "logs": []}
+
+def load_logs(log_file: str = None) -> list:
+    if log_file is None:
+        log_file = get_log_file()
+    return _load_file_data(log_file).get("logs", [])
 
 def load_all_logs() -> list:
     all_logs = []
     if not os.path.exists(LOGS_DIR):
         return all_logs
     for fname in sorted(os.listdir(LOGS_DIR)):
-        if fname.endswith(".json"):
+        if fname.endswith(".json") and fname not in ["paused.json", "pause_status.json"]:
             fpath = os.path.join(LOGS_DIR, fname)
-            try:
-                with open(fpath, "r") as f:
-                    all_logs.extend(json.load(f))
-            except Exception:
-                pass
+            all_logs.extend(_load_file_data(fpath).get("logs", []))
     return all_logs
 
 def save_logs(logs: list, log_file: str = None):
     if log_file is None:
         log_file = get_log_file()
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
+
+    # Preserve existing pause metadata
+    existing = _load_file_data(log_file)
 
     ordered_logs = []
     for log in logs:
@@ -294,8 +388,14 @@ def save_logs(logs: list, log_file: str = None):
                 ordered_log[k] = v
         ordered_logs.append(ordered_log)
 
+    file_data = {
+        "paused": existing.get("paused", False),
+        "pause_count": existing.get("pause_count", 0),
+        "logs": ordered_logs
+    }
+
     with open(log_file, "w") as f:
-        json.dump(ordered_logs, f, indent=2)
+        json.dump(file_data, f, indent=2)
 
 
 def _build_entry(app, window, start: datetime, end: datetime, metrics: dict) -> dict:
@@ -317,35 +417,36 @@ def _build_entry(app, window, start: datetime, end: datetime, metrics: dict) -> 
 
 # ── Pause helpers ─────────────────────────────────────────────────────────────
 
-def get_pause_data() -> dict:
-    if os.path.exists(PAUSE_FILE):
-        try:
-            with open(PAUSE_FILE, "r") as f:
-                data = json.load(f)
-                return {
-                    "paused": data.get("paused", False),
-                    "pause_count": data.get("pause_count", 0)
-                }
-        except Exception:
-            pass
-    return {"paused": False, "pause_count": 0}
+def get_pause_data(dt: datetime = None) -> dict:
+    log_file = get_log_file(dt)
+    data = _load_file_data(log_file)
+    return {
+        "paused": data.get("paused", False),
+        "pause_count": data.get("pause_count", 0),
+        "date": dt.strftime("%d-%m-%Y") if dt else today_str()
+    }
 
 def is_paused() -> bool:
     return get_pause_data().get("paused", False)
 
 def set_paused(paused: bool) -> dict:
-    os.makedirs(os.path.dirname(PAUSE_FILE), exist_ok=True)
-    current_data = get_pause_data()
-    
-    if paused and not current_data["paused"]:
-        current_data["pause_count"] += 1
-        
-    current_data["paused"] = paused
+    log_file = get_log_file()
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+    data = _load_file_data(log_file)
 
-    with open(PAUSE_FILE, "w") as f:
-        json.dump(current_data, f, indent=2)
-        
-    return current_data
+    if paused and not data.get("paused", False):
+        data["pause_count"] = data.get("pause_count", 0) + 1
+
+    data["paused"] = paused
+
+    with open(log_file, "w") as f:
+        json.dump(data, f, indent=2)
+
+    return {
+        "paused": paused,
+        "pause_count": data.get("pause_count", 0),
+        "date": today_str()
+    }
 
 
 # ── Tracker loop ──────────────────────────────────────────────────────────────
@@ -358,39 +459,48 @@ def track_activity():
     while True:
         try:
             if is_paused():
-                if current_app is not None:
-                    end_time = datetime.now()
-                    duration = (end_time - start_time).total_seconds() / 60.0
-                    if duration >= 0.05:
-                        log_file = get_log_file(start_time)
-                        logs = load_logs(log_file)
+                now = datetime.now()
+                if current_app != "System" or current_window != "Paused":
+                    if current_app is not None:
+                        duration = (now - start_time).total_seconds() / 60.0
                         activity_metrics = get_and_reset_metrics()
-                        logs.append(_build_entry(current_app, current_window, start_time, end_time, activity_metrics))
-                        save_logs(logs, log_file)
-                    current_app = None
+                        if current_app != "Unknown" and duration >= 0.05:
+                            log_file = get_log_file(start_time)
+                            logs = load_logs(log_file)
+                            logs.append(_build_entry(current_app, current_window, start_time, now, activity_metrics))
+                            save_logs(logs, log_file)
+                            print(f"[{human_date(start_time)}] Logged: {current_app} – {current_window} ({round(duration,2)}m) | Inputs: {activity_metrics}")
+                    else:
+                        get_and_reset_metrics()
+                        
+                    current_app = "System"
+                    current_window = "Paused"
+                    start_time = now
                 else:
                     # Keep clearing out peripheral metrics while paused so they don't leak into the next cycle
                     get_and_reset_metrics()
+                
                 time.sleep(2)
                 continue
 
             app, window = get_active_window_title_and_app()
-
-            if not app or app == "Unknown":
-                time.sleep(2)
-                continue
+            
+            if not app:
+                app = "Unknown"
 
             if app != current_app or window != current_window:
                 now = datetime.now()
                 if current_app is not None:
                     duration = (now - start_time).total_seconds() / 60.0
-                    if duration >= 0.05:
+                    activity_metrics = get_and_reset_metrics()
+                    if current_app != "Unknown" and duration >= 0.05:
                         log_file = get_log_file(start_time)
                         logs = load_logs(log_file)
-                        activity_metrics = get_and_reset_metrics()
                         logs.append(_build_entry(current_app, current_window, start_time, now, activity_metrics))
                         save_logs(logs, log_file)
                         print(f"[{human_date(start_time)}] Logged: {current_app} – {current_window} ({round(duration,2)}m) | Inputs: {activity_metrics}")
+                else:
+                    get_and_reset_metrics()
 
                 current_app = app
                 current_window = window
@@ -455,11 +565,26 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(dates).encode())
 
         elif parsed.path.startswith("/api/status"):
+            date_param = params.get("date", [None])[0]
+            dt = None
+            if date_param:
+                try:
+                    normalized = date_param.replace("/", "-")
+                    dt = datetime.strptime(normalized, "%d-%m-%Y")
+                except Exception:
+                    pass
+            
+            pause_data = get_pause_data(dt)
+            live_status = get_pause_data()
+            
             self.send_response(200)
             self._send_cors_headers()
             self.send_header("Content-type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps({"paused": is_paused()}).encode())
+            self.wfile.write(json.dumps({
+                "paused": live_status.get("paused", False),
+                "pause_count": pause_data.get("pause_count", 0)
+            }).encode())
 
         else:
             self.send_response(404)
@@ -473,8 +598,8 @@ class RequestHandler(BaseHTTPRequestHandler):
         if parsed_path.path == "/api/pause":
             data = json.loads(post_data.decode("utf-8"))
             paused = data.get("paused", False)
-            set_paused(paused)
-            self._json_response({"success": True, "paused": paused})
+            new_data = set_paused(paused)
+            self._json_response({"success": True, "paused": paused, "pause_count": new_data.get("pause_count", 0)})
 
         elif parsed_path.path == "/api/update_logs":
             data = json.loads(post_data.decode("utf-8"))
@@ -506,6 +631,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 
 def run_server():
     server_address = ("", 5173)
+    HTTPServer.allow_reuse_address = True
     httpd = HTTPServer(server_address, RequestHandler)
     print("Local API server running on port 5173…")
     httpd.serve_forever()

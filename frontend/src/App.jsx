@@ -154,7 +154,7 @@ const App = () => {
       const t = Date.now();
       const [logsRes, statusRes] = await Promise.all([
         fetch(`${API_BASE}/logs?date=${selectedDate}&t=${t}`, { cache: 'no-store' }),
-        fetch(`${API_BASE}/status?t=${t}`, { cache: 'no-store' })
+        fetch(`${API_BASE}/status?date=${selectedDate}&t=${t}`, { cache: 'no-store' })
       ]);
       if (isGeneratingRef.current) return;
       setLogs(await logsRes.json());
@@ -183,12 +183,16 @@ const App = () => {
   const togglePause = async () => {
     try {
       const newState = !isPaused;
-      await fetch(`${API_BASE}/pause`, {
+      const res = await fetch(`${API_BASE}/pause`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ paused: newState })
       });
+      const data = await res.json();
       setIsPaused(newState);
+      if (selectedDate === moment().format('DD-MM-YYYY')) {
+        setPauseCount(data.pause_count || 0);
+      }
     } catch (err) { }
   };
 
